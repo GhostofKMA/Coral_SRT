@@ -30,7 +30,7 @@ class DVT(nn.Module):
         self.pos_embed = None
     def forward(self, x):
         B, C, H, W = x.shape
-        x = x.flatten(2).transpose(1, 2)  # B, N, C where N=H*W
+        x = x.flatten(2).transpose(1, 2)  
         x = self.transformer_blocks(x)
         x = x.transpose(1, 2).reshape(B, C, H, W)
         return x
