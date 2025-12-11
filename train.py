@@ -16,10 +16,10 @@ def get_args():
     parser.add_argument('--epochs', type=int, default=50, help='Number of training epochs')
     parser.add_argument('--learning_rate', type=float, default=1e-4, help='Learning rate for optimizer')
     parser.add_argument('--weight_decay', type=float, default=1e-5, help='Weight decay for AdamW')
-    parser.add_argument('--device', type=str, default='cuda' if torch.cuda.is_available() else 'cpu', help='Device to use for training')
     return parser.parse_args()
 
 def train():
+    device = "cuda"
     args = get_args()
     model_name = args.model_name
     mode = args.mode
@@ -67,32 +67,24 @@ def train():
     model = DVT(feature_dim=feature_dim, num_transformer_blocks=4).to(args.device)
     model.train()
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.learning_rate,weight_decay=args.weight_decay)
-    scheduler = CosineAnnealingLR(optimizer, T_max=args.epochs, eta_min=1e-6)
-    accumulation_steps = 8
     for epoch in range(args.epochs):
         epoch_loss = 0.0
-        optimizer.zero_grad()
         pbar = tqdm(dataloader, desc=f"Epoch {epoch+1}/{args.epochs}")
         for i, (raw_batch, target_batch) in enumerate(pbar):
-            raw_batch = raw_batch.to(args.device)
-            target_batch = target_batch.to(args.device)
+            raw_batch = raw_batch.to(device)
+            target_batch = target_batch.to(device)
             output_batch = model(raw_batch)
             mse_loss = F.mse_loss(output_batch, target_batch) 
             pred_flat = output_batch.permute(0,2,3,1).flatten(0,2)
             target_flat = target_batch.permute(0,2,3,1).flatten(0,2)
             cos_loss = 1 - F.cosine_similarity(pred_flat, target_flat, dim=1).mean()
             loss = mse_loss + cos_loss
-            loss = loss / accumulation_steps
             loss.backward()
-            if (i + 1) % accumulation_steps == 0:
-                optimizer.step()
-                optimizer.zero_grad()
-            epoch_loss += loss.item() * accumulation_steps 
-            pbar.set_postfix(loss=loss.item() * accumulation_steps)
-        scheduler.step()
-        current_lr = scheduler.get_last_lr()[0]
+            optimizer.step()
+            optimizer.zero_grad()
+            epoch_loss += loss.item() 
         epoch_loss /= len(dataloader)
-        print(f"Epoch {epoch+1}/{args.epochs} | Loss: {epoch_loss:.6f} | LR: {current_lr:.8f}")
+        print(f"Epoch {epoch+1}/{args.epochs} | Loss: {epoch_loss:.6f}")
 
         if (epoch + 1) % 10 == 0 or (epoch + 1) == args.epochs:
             ckpt_name = f"{args.model_name}_{args.mode}_ep{epoch+1}.pth"

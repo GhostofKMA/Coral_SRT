@@ -16,7 +16,6 @@ def get_args():
     parser.add_argument("--data_dir", type=str, required=True, help="Directory containing images")
     parser.add_argument("--output_file", type=str, required=True, help="File to save extracted features")
     parser.add_argument("--model_name", type=str, required=True,choices=["SAM","SAM_2","DINO_S_16","DINO_B_16","DINOv2_B_14","DINOv2_S_14","DINOv2_Reg","CoralSCOP"], help="Model name")
-    parser.add_argument("--image_size", type=int, default=-1, help="Max long side size. Set -1 to use ORIGINAL image size.")
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu", help="Device to run the model on")
     return parser.parse_args()
 
@@ -118,91 +117,85 @@ def get_sam_feature_extractor(model, image, model_name, device):
 
 
 def main():
-    state_dict = None
-    repo = None
-    ckpt_name = None
     args = get_args()
     device = torch.device(args.device)
-    is_sam =False
+
+    is_sam = False
+    model = None
+    feat_extractor = None
+    
     if args.model_name == "SAM":
         model = load_sam_model("vit_h", device)
-        is_sam =True
+        is_sam = True
     elif args.model_name == "SAM_2":
         model = load_sam2_model(device)
-        is_sam =True
+        is_sam = True
     elif args.model_name == "DINO_S_16":
-        model = vit_small(patch_size=16, num_register_tokens =0)
-        repo = "facebookresearch/dino:main"
-        ckpt_name = "dino_vits16"
+        model = vit_small(patch_size=16, num_register_tokens=0)
+        repo, ckpt = "facebookresearch/dino:main", "dino_vits16"
     elif args.model_name == "DINO_B_16":
-        model = vit_base(patch_size=16, num_register_tokens =0)
-        repo = "facebookresearch/dino:main"
-        ckpt_name = "dino_vitb16"
+        model = vit_base(patch_size=16, num_register_tokens=0)
+        repo, ckpt = "facebookresearch/dino:main", "dino_vitb16"
     elif args.model_name == "DINOv2_B_14":
-        model = vit_base(patch_size=14, num_register_tokens =0)
-        repo = "facebookresearch/dinov2"
-        ckpt_name = "dinov2_vitb14"
+        model = vit_base(patch_size=14, num_register_tokens=0)
+        repo, ckpt = "facebookresearch/dinov2", "dinov2_vitb14"
     elif args.model_name == "DINOv2_S_14":
-        model = vit_small(patch_size=14, num_register_tokens =0)
-        repo = "facebookresearch/dinov2"
-        ckpt_name = "dinov2_vits14"
+        model = vit_small(patch_size=14, num_register_tokens=0)
+        repo, ckpt = "facebookresearch/dinov2", "dinov2_vits14"
     elif args.model_name == "DINOv2_Reg":
-        model = vit_base_r4(patch_size=14, num_register_tokens =4)
-        repo = "facebookresearch/dinov2"
-        ckpt_name = "dinov2_vitb14_reg"
+        model = vit_base_r4(patch_size=14, num_register_tokens=4)
+        repo, ckpt = "facebookresearch/dinov2", "dinov2_vitb14_reg"
     elif args.model_name == "CoralSCOP":
-        pass
         return
-    if repo is not None and ckpt_name is not None:
-        pretrained_model = torch.hub.load(repo, ckpt_name)
-        if hasattr(pretrained_model, 'state_dict'):
-            state_dict = pretrained_model.state_dict()
-        else:
-            state_dict = pretrained_model
-    if state_dict is not None:
+
+    if not is_sam and 'repo' in locals():
+        pretrained_model = torch.hub.load(repo, ckpt)
+        state_dict = pretrained_model.state_dict() if hasattr(pretrained_model, 'state_dict') else pretrained_model
         state_dict = interpolate_pos_embed(state_dict, model)
-        msg = model.load_state_dict(state_dict, strict=False)
+        model.load_state_dict(state_dict, strict=False)
         model.to(device)
         model.eval()
-        feat_extractor = ViTFeat(model, feat_dim= model.embed_dim, vit_feat="k",patch_size=model.patch_embed.patch_size)
-    transform = transforms.Compose([
+        feat_extractor = ViTFeat(model, feat_dim=model.embed_dim, vit_feat="k", patch_size=model.patch_embed.patch_size)
+
+    transform_tensor = transforms.Compose([
         transforms.ToTensor(),
         transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
     ])
-    image_files = [os.path.join(args.data_dir, f) for f in os.listdir(args.data_dir) if f.lower().endswith(('.png', '.jpg', '.jpeg'))]
+
+    image_files = [os.path.join(args.data_dir, f) for f in os.listdir(args.data_dir) 
+                   if f.lower().endswith(('.png', '.jpg', '.jpeg'))]
     image_files.sort()
-    limit = 8000
-    if len(image_files) > limit:
-        print(f"Dataset quá lớn ({len(image_files)}), đang giảm xuống {limit} ảnh để tiết kiệm bộ nhớ...")
-        image_files = image_files[:limit]
+    
+
     with torch.no_grad():
         for img_file in tqdm(image_files):
             base_name = os.path.basename(img_file).split('.')[0]
             save_path = os.path.join(args.output_file, base_name + '.npy')
             if os.path.exists(save_path):
                 continue
-            image = Image.open(img_file).convert("RGB")
+        
+            image_pil = Image.open(img_file).convert("RGB")
+            
+            if not is_sam:
+                image_pil = image_pil.resize((518, 518), Image.BICUBIC)
+        
             if is_sam:
-                features = get_sam_feature_extractor(model , image, args.model_name, device)
+                features = get_sam_feature_extractor(model, image_pil, args.model_name, device)
             else:
-                W, H = image.size
+                img_tensor = transform_tensor(image_pil).unsqueeze(0).to(device)
+                out = feat_extractor.model.get_intermediate_layers(img_tensor, n=1)[0]
                 patch_size = model.patch_embed.patch_size
-                if args.image_size > 0:
-                    scale = args.image_size / max(W, H)
-                    new_W = int(W * scale)
-                    new_H = int(H * scale)
-                else:
-                    new_W, new_H = W, H
-                    
-                new_W = max(new_W, patch_size)
-                new_H = max(new_H, patch_size)
-                if new_W != W or new_H != H:
-                    image = image.resize((new_W, new_H), Image.BILINEAR)
+                H_feat = 518 // patch_size 
+                W_feat = 518 // patch_size
+                num_patches = H_feat * W_feat
 
-                img_tensor = transform(image).unsqueeze(0).to(device)
-                features = feat_extractor(img_tensor).cpu().numpy().squeeze(0)
-            print(f"File: {base_name} | Input: {image.size} | Output Feature Map: {features.shape}")
+                patch_tokens = out[:, -num_patches:, :] 
+     
+                B, N, Dim = patch_tokens.shape
+                features = patch_tokens.transpose(1, 2).reshape(B, Dim, H_feat, W_feat)
+                features = features.cpu().numpy().squeeze(0)
 
+            print(f"File: {base_name} | Input: {image_pil.size} | Output: {features.shape}")
             np.save(save_path, features)
 
 if __name__ == "__main__":

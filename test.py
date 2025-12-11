@@ -1,159 +1,126 @@
 import argparse
 import numpy as np
 import torch
-import faiss
-import os
 import torch.nn.functional as F
+import os
 from PIL import Image
 from tqdm import tqdm
 
-# Bảng màu (giữ nguyên để output ảnh đẹp)
-colors = [[167, 18, 159], [180, 27, 92], [104, 139, 233], [49, 198, 135], [98, 207, 26], [118, 208, 133],
-          [158, 118, 90], [12, 72, 166], [69, 79, 238], [81, 195, 49], [221, 236, 52], [160, 200, 222],
-          [255, 63, 216], [16, 94, 7], [226, 47, 64], [183, 108, 5],
-          [55, 252, 193], [147, 154, 196], [233, 78, 165], [108, 25, 95], [184, 221, 46], [54, 205, 145],
-          [14, 101, 210], [199, 232, 230], [66, 10, 103], [161, 228, 59], [108, 2, 104], [13, 49, 127],
-          [186, 99, 38], [97, 140, 246], [44, 114, 202], [36, 31, 118], [146, 77, 143],
-          [188, 100, 14], [131, 69, 63]]
-
 def get_args():
-    parser = argparse.ArgumentParser(description="Test Baseline (Raw Features + k-NN)")
-    parser.add_argument('--feature_dir', type=str, required=True, help='Path to the .npy feature files')
-    parser.add_argument('--mask_dir', type=str, default="D:/Coral_SRT/data/test/masks", help='Path to ground truth masks')
-    parser.add_argument('--result_dir', type=str, default="D:/Coral_SRT/results/baseline", help='Folder to save result images')
-    parser.add_argument('--num_points', type=int, default=5, choices=[5,10,20,50,100], help='Number of sparse labels per image')
+    parser = argparse.ArgumentParser(description="Fast Baseline Evaluation (Metrics Only)")
+    parser.add_argument('--feature_dir', type=str, required=True, help='Path to .npy features')
+    parser.add_argument('--mask_dir', type=str, default="/home/duy-anh/Coral_SRT/data/test/masks")
+    parser.add_argument('--num_points', type=int, default=5, choices=[5,10,20,50,100])
+    parser.add_argument('--test_size', type=int, default=1024, help='Evaluation resolution')
     return parser.parse_args()
 
-def sample_sparse_labels(label_mask, total_num_points):
-    ys, xs = np.where(label_mask > 0)
-    num_valid_pixels = len(xs)
-    if num_valid_pixels == 0:
-        return torch.tensor([]), torch.tensor([])
-    if num_valid_pixels < total_num_points:
-        chosen_indices = np.arange(num_valid_pixels)
-    else:
-        chosen_indices = np.random.choice(num_valid_pixels, total_num_points, replace=False)
+def sample_points(label_mask, total_num_points):
+    unique_classes = np.unique(label_mask)
     sampled_coords = []
     sampled_labels = []
-    for idx in chosen_indices:
-        y, x = ys[idx], xs[idx]
-        sampled_coords.append((y, x))
-        sampled_labels.append(label_mask[y, x])
+    
+    for cls in unique_classes:
+        ys, xs = np.where(label_mask == cls)
+        if len(xs) > 0:
+            idx = np.random.choice(len(xs))
+            sampled_coords.append((ys[idx], xs[idx]))
+            sampled_labels.append(cls)
+            
+    current = len(sampled_coords)
+    if current < total_num_points:
+        rem = total_num_points - current
+        ys_all, xs_all = np.where(label_mask > -1)
+        if len(xs_all) > 0:
+            idx_list = np.random.choice(len(xs_all), rem, replace=False)
+            sampled_coords.extend(zip(ys_all[idx_list], xs_all[idx_list]))
+            sampled_labels.extend(label_mask[ys_all[idx_list], xs_all[idx_list]])
+                
     return torch.tensor(sampled_coords), torch.tensor(sampled_labels)
 
 def perform_knn(feature_map, support_coords, support_labels):
-    # feature_map shape: (C, H, W)
+    device = feature_map.device
     C, H, W = feature_map.shape
-
-    query_feats = feature_map.reshape(C, -1).T.cpu().numpy()  # (H*W, C)
-    query_feats = np.ascontiguousarray(query_feats, dtype=np.float32)
-
-    flat_feats = feature_map.reshape(C, -1)
+    
+    query_feats = feature_map.view(C, -1).permute(1, 0) 
+    query_feats = F.normalize(query_feats, p=2, dim=1)
+    
     flat_indices = support_coords[:, 0] * W + support_coords[:, 1]
-    
-    support_feats = flat_feats[:, flat_indices].T.cpu().numpy()  # (num_support, C)
-    support_feats = np.ascontiguousarray(support_feats, dtype=np.float32)
-    
-    support_labels = support_labels.cpu().numpy()
+    flat_feats = feature_map.view(C, -1)
+    support_feats = flat_feats[:, flat_indices.to(device)].permute(1, 0)
+    support_feats = F.normalize(support_feats, p=2, dim=1)
 
-    faiss.normalize_L2(support_feats)
-    faiss.normalize_L2(query_feats)
-
-    index = faiss.IndexFlatIP(C)
-    index.add(support_feats)
+    sim_matrix = torch.matmul(query_feats, support_feats.T)
+    _, best_indices = torch.max(sim_matrix, dim=1)
     
-    D, I = index.search(query_feats, k=1)
-    
-    predicted_labels = support_labels[I.flatten()]  
-    pred_mask = torch.from_numpy(predicted_labels).view(H, W)
-    return pred_mask
+    pred_labels = support_labels.to(device)[best_indices]
+    return pred_labels.view(H, W)
 
-def save_colored_mask(mask_array, save_path):
-    mask_img = Image.fromarray(mask_array.astype(np.uint8), mode='P')
-    palette = []
-    for color in colors:
-        palette.extend(color)
-    if len(palette) < 768:
-        palette.extend([0] * (768 - len(palette)))
-    mask_img.putpalette(palette)
-    mask_img.save(save_path)
-
-def compute_metrics(pred, gt):
+def fast_compute_metrics(pred, gt):
+    pred = pred.flatten()
+    gt = gt.flatten()
     ids = torch.unique(torch.cat([pred, gt]))
-    ious = []
-    accs = []
+    
+    ious, accs = [], []
     for uid in ids:
-        pred_mask = (pred == uid)
-        gt_mask = (gt == uid)
-        intersection = (pred_mask & gt_mask).sum().item()
-        union = (pred_mask | gt_mask).sum().item()
-        pred_count = pred_mask.sum().item()
-        if union > 0:
-            ious.append(intersection/union)
-        if pred_count >0:
-            accs.append(intersection/pred_count)
-        else:
-            if gt_mask.sum().item() > 0: 
-                accs.append(0.0)
-
-    miou = torch.mean(torch.tensor(ious)).item() if len(ious) > 0 else 0.0
-    mpa = torch.mean(torch.tensor(accs)).item() if len(accs) > 0 else 0.0
+        p_mask = (pred == uid)
+        g_mask = (gt == uid)
+        
+        inter = (p_mask & g_mask).sum().float()
+        union = (p_mask | g_mask).sum().float()
+        pred_count = p_mask.sum().float()
+        
+        if union > 0: ious.append(inter / union)
+        if pred_count > 0: accs.append(inter / pred_count)
+        elif g_mask.sum() > 0: accs.append(torch.tensor(0.0, device=pred.device))
+            
+    miou = torch.stack(ious).mean().item() if ious else 0.0
+    mpa = torch.stack(accs).mean().item() if accs else 0.0
     return miou, mpa
 
 def main():
-    device = 'cuda'
-    np.random.seed(42)
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     torch.manual_seed(42)
+    np.random.seed(42)
     args = get_args()
     
-    save_dir = os.path.join(args.result_dir, f"{args.num_points}_points")
-    os.makedirs(save_dir, exist_ok=True)
+    files = [f for f in os.listdir(args.feature_dir) if f.endswith('.npy')]
+    ious, accs = [], []
     
-    feat_files = [f for f in os.listdir(args.feature_dir) if f.endswith('.npy')]
-    
-
-    all_ious = []
-    all_accs = []
-
-    for feat_name in tqdm(feat_files):
-        base_name = os.path.splitext(feat_name)[0]
-        feat_path = os.path.join(args.feature_dir, feat_name)
-        mask_path = os.path.join(args.mask_dir, base_name + ".png") 
-        if not os.path.exists(mask_path):
-            continue
-        features = np.load(feat_path)
-
-        raw_feat_tensor = torch.from_numpy(features).float().unsqueeze(0).float().to(device)
-        gt_mask_pil = Image.open(mask_path)
-        W_orig, H_orig = gt_mask_pil.size
-        gt_mask_np = np.array(gt_mask_pil)
-        rec_feat_upsampled = F.interpolate(raw_feat_tensor, size=(H_orig,W_orig),mode='bilinear',align_corners=False).squeeze(0)    
-
-        coords, labels = sample_sparse_labels(gt_mask_np, args.num_points)
-        
-        if len(coords) == 0:
-            continue
-
-        pred_mask_tensor = perform_knn(rec_feat_upsampled, coords, labels)
-        gt_mask_tensor = torch.from_numpy(gt_mask_np).long().to(device)
-        miou, mpa = compute_metrics(pred_mask_tensor, gt_mask_tensor)
-        all_ious.append(miou)
-        all_accs.append(mpa)
-
-
-        save_path = os.path.join(save_dir, base_name + ".png")
-        save_colored_mask(pred_mask_tensor.cpu().numpy(), save_path)
-
-    avg_miou = np.mean(all_ious) * 100 if len(all_ious) > 0 else 0
-    avg_mpa = np.mean(all_accs) * 100 if len(all_accs) > 0 else 0
-
-    print("\n" + "="*40)
-    print(f"📊 BASELINE RESULTS (k-NN, No Training)")
-    print(f"Feature Source: {os.path.basename(args.feature_dir)}")
-    print(f"Num Points:     {args.num_points}")
-    print(f"Mean IoU:       {avg_miou:.2f}")
-    print(f"Mean PA :       {avg_mpa:.2f}")
-    print("="*40)
+    with torch.no_grad():
+        for f in tqdm(files):
+            base = os.path.splitext(f)[0]
+            mask_path = os.path.join(args.mask_dir, base + ".png")
+            if not os.path.exists(mask_path):
+                mask_path = os.path.join(args.mask_dir, base + ".jpg")
+                if not os.path.exists(mask_path): continue
+            
+            feat_np = np.load(os.path.join(args.feature_dir, f))
+            raw_feat = torch.from_numpy(feat_np).float().to(device).unsqueeze(0) 
+  
+            gt_pil = Image.open(mask_path)
+            W_orig, H_orig = gt_pil.size
+            scale = args.test_size / max(W_orig, H_orig)
+            new_W, new_H = int(W_orig * scale), int(H_orig * scale)
+            
+            gt_pil_resized = gt_pil.resize((new_W, new_H), Image.NEAREST)
+            gt_np = np.array(gt_pil_resized)
+            
+            rec_feat = F.interpolate(raw_feat, size=(new_H, new_W), mode='bilinear', align_corners=False).squeeze(0)
+            
+            coords, labels = sample_points(gt_np, args.num_points)
+            if len(coords) == 0: continue
+            
+            pred_mask = perform_knn(rec_feat, coords, labels)
+            
+            gt_tensor = torch.from_numpy(gt_np).long().to(device)
+            miou, mpa = fast_compute_metrics(pred_mask, gt_tensor)
+            
+            ious.append(miou)
+            accs.append(mpa)
+            
+    print(f"\nRESULT ({args.num_points} points):")
+    print(f"Mean IoU: {np.mean(ious)*100:.2f}")
+    print(f"Mean PA : {np.mean(accs)*100:.2f}")
 
 if __name__ == "__main__":
     main()
